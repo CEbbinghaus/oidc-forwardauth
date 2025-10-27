@@ -16,8 +16,8 @@ pub struct OIDCProvider {
     pub client_secret: ClientSecret,
     pub issuer_url: IssuerUrl,
     pub scopes: Vec<Scope>,
-    pub jwks: JwkSet,
-    pub audience: Vec<String>,
+    pub _jwks: JwkSet,
+    pub _audience: Vec<String>,
 }
 
 impl OIDCProvider {
@@ -61,8 +61,8 @@ impl OIDCProvider {
                 .filter(|s| !s.is_empty())
                 .map(|s| Scope::new(s.trim().to_string()))
                 .collect(),
-            audience: audience.split(',').map(String::from).collect(),
-            jwks,
+            _audience: audience.split(',').map(String::from).collect(),
+            _jwks: jwks,
         }
     }
 }

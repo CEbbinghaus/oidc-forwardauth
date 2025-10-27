@@ -1,15 +1,12 @@
 mod oidc_providers;
 mod salvo_utils;
 
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{decode as jwt_decode, decode_header, DecodingKey, Validation};
 use oidc_providers::OIDCProviders;
 use openidconnect::core::{
-    CoreClient, CoreGenderClaim, CoreIdToken, CoreProviderMetadata, CoreResponseType,
+    CoreClient, CoreProviderMetadata, CoreResponseType,
 };
 use openidconnect::{
     reqwest, AdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet,
-    IdTokenClaims, StandardClaims,
 };
 use openidconnect::{
     AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
@@ -56,6 +53,7 @@ struct AuthRequestData {
 
 #[derive(Serialize, Deserialize)]
 struct AuthData {
+    pub nonce: Nonce,
     pub subject: String,
     pub name: Option<String>,
     pub username: Option<String>,
@@ -84,7 +82,7 @@ struct ForwardAuthHeaders {
 async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mut Depot) {
     let client = depot.obtain::<InitializedClient>().unwrap().clone();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
-    let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
+    // let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let (authorize_url, csrf_state, nonce) = client
@@ -161,6 +159,15 @@ fn has_refresh_token(req: &mut Request, _state: &mut PathState) -> bool {
 
 #[handler]
 async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut Depot) {
+    let session = &get_cookie(req, SESSION_COOKIE_NAME);
+
+    if session.is_empty() {
+        debug!("Session cookie was empty");
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("No active Session."));
+    }
+
     let refresh_token = decode(&get_cookie(req, REFRESH_TOKEN_COOKIE_NAME))
         .unwrap()
         .to_string();
@@ -212,6 +219,38 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
         res.status_code(StatusCode::UNAUTHORIZED);
     }
 
+    let mut cache = CACHE.get().unwrap().write();
+
+    let Ok(Some(auth_data)) = cache.get::<AuthData>(session) else {
+        debug!("Session {session} has expired or is no longer valid");
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Invalid Session"));
+    };
+
+    let id_token_verifier = client.id_token_verifier();
+    let id_token= token_response.id_token().expect("IdToken to exist");
+
+
+    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_data.nonce) else {
+        warn!("Unable to verify id_token '{}'", id_token.to_string());
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Invalid id_token"));
+    };
+    
+    let validity_period = claims
+        .expiration()
+        .signed_duration_since(k8s_openapi::chrono::Local::now());
+
+    if validity_period.num_seconds() < 0 {
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Token has expireds"));
+    }    
+
+    cache.set_with_ttl(&session, auth_data, validity_period.num_seconds() as u64).expect("Writing to succeed");
+
     res.add_cookie(
         Cookie::build((ACCESS_TOKEN_COOKIE_NAME, access_token.to_owned()))
             .secure(headers.https)
@@ -236,7 +275,7 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
 // TODO: Refactor from path check to middleware
 fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
-    let hostname = get_header(req, "x-forwarded-host");
+    // let hostname = get_header(req, "x-forwarded-host");
     // let token = get_cookie(req, ID_TOKEN_COOKIE_NAME);
     let session_id = get_cookie(req, SESSION_COOKIE_NAME);
 
@@ -385,6 +424,7 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
     cache.set_with_ttl(
         &state,
         AuthData {
+            nonce: auth_state.nonce,
             subject: claims.subject().to_string(),
             email: claims.email().map(|v| v.to_string()),
             name: claims.name().map(|v| v.get(None).unwrap().to_string()),
