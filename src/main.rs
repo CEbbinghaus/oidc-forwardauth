@@ -134,8 +134,7 @@ async fn ok_handler(req: &mut Request, res: &mut Response) {
 
     if let Some(username) = req.headers().get("X-Forwarded-Username") {
         debug!("X-Forwarded-Username: {}", &username.to_str().unwrap());
-        // headers.insert("X-Forwarded-Username", username.to_owned());
-        headers.insert("X-Forwarded-Username", HeaderValue::from_str("CEbbinghaus").unwrap());
+        headers.insert("X-Forwarded-Username", username.to_owned());
     }
 
     if let Some(email) = req.headers().get("X-Forwarded-Email") {
