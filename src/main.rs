@@ -5,10 +5,10 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode as jwt_decode, decode_header, DecodingKey, Validation};
 use oidc_providers::OIDCProviders;
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
-use openidconnect::reqwest::http_client;
+use openidconnect::{reqwest, EndpointMaybeSet, EndpointNotSet, EndpointSet};
 use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
+    AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
 };
 use salvo::http::cookie::Cookie;
 use salvo::http::{HeaderValue, StatusCode};
@@ -21,15 +21,32 @@ use salvo::{Listener, Service};
 use salvo_utils::{get_cookie, get_header, get_query_param, security_middleware};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
+use tinykv::TinyKV;
 use tracing::{debug, info, warn};
 use urlencoding::decode;
 
 static PROVIDERS: OnceLock<OIDCProviders> = OnceLock::new();
+static CACHE: OnceLock<RwLock<TinyKV>> = OnceLock::new();
 static ACCESS_TOKEN_COOKIE_NAME: &str = "x_oidc_access_token";
+static ID_TOKEN_COOKIE_NAME: &str = "x_oidc_id_token";
 static REFRESH_TOKEN_COOKIE_NAME: &str = "x_oidc_refresh_token";
 static STATE_COOKIE_NAME: &str = "x_oidc_csrf";
-static PKCS_COOKIE_NAME: &str = "x_oidc_pkce";
+
+pub type InitializedClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+
+#[derive(Serialize, Deserialize)]
+struct AuthRequestData {
+    pub pkce_token: String,
+    pub nonce: Nonce,
+}
 
 #[derive(Clone, Debug)]
 struct ForwardAuthHeaders {
@@ -41,12 +58,12 @@ struct ForwardAuthHeaders {
 
 #[handler]
 async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mut Depot) {
-    let client = depot.obtain::<CoreClient>().unwrap();
+    let client = depot.obtain::<InitializedClient>().unwrap().clone();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (authorize_url, csrf_state, _nonce) = client
+    let (authorize_url, csrf_state, nonce) = client
         .authorize_url(
             AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
             CsrfToken::new_random,
@@ -56,12 +73,18 @@ async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mu
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    res.add_cookie(
-        Cookie::build((PKCS_COOKIE_NAME, pkce_verifier.secret().to_string()))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
+    let auth_request_data = AuthRequestData {
+        pkce_token: pkce_verifier.secret().clone(),
+        nonce,
+    };
+
+    let mut cache_write = CACHE.get().unwrap().write().expect("Write to be Aquired");
+
+    // TODO: Add auth timeout
+    cache_write
+        .set(csrf_state.secret(), auth_request_data)
+        .expect("Cache write to succeed");
+
     res.add_cookie(
         Cookie::build((STATE_COOKIE_NAME, csrf_state.secret().to_string()))
             .secure(headers.https)
@@ -117,14 +140,21 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
         .unwrap()
         .to_string();
 
-    let client = depot.obtain::<CoreClient>().unwrap();
+    let http_client = reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Htttp Client to build");
+
+    let client = depot.obtain::<InitializedClient>().unwrap();
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
 
     let token_response = match client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_owned()))
+        .expect("Refresh token to be valid")
         .add_scopes(scopes) // TODO: Test if required
-        .request(http_client)
+        .request_async(&http_client)
+        .await
     {
         Ok(v) => v,
         Err(err) => {
@@ -247,42 +277,86 @@ fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
 
 fn check_params(req: &mut Request, _state: &mut PathState) -> bool {
     let uri = get_header(req, "x-forwarded-uri");
-    let csrf_state = get_cookie(req, STATE_COOKIE_NAME);
-    let code = get_query_param(&uri, "code");
+    let cache_read = CACHE.get().unwrap().read().expect("Cache to be readable");
     let state = get_query_param(&uri, "state");
+    let code = get_query_param(&uri, "code");
 
     return !(uri.is_empty()
         || code.is_empty()
         || state.is_empty()
-        || csrf_state.is_empty()
-        || state != csrf_state);
+        || !cache_read.contains_key(&state));
 }
 
 #[handler]
-async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
-    let client = depot.obtain::<CoreClient>().unwrap();
+fn set_cookie(res: &mut Response, depot: &mut Depot) {
+    let client = depot.obtain::<InitializedClient>().unwrap();
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
 
-    let code = get_query_param(&headers.uri, "code");
-    let pkce_verifier = get_cookie(req, PKCS_COOKIE_NAME);
+    let http_client = reqwest::blocking::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Htttp Client to build");
 
+    let code = get_query_param(&headers.uri, "code");
     if code.is_empty() {
         return res
             .status_code(StatusCode::BAD_GATEWAY)
             .render(Text::Plain("No Token in response."));
     }
 
+    let state = get_query_param(&headers.uri, "state");
+
+    let mut cache = CACHE.get().unwrap().write().expect("Cache to be writable");
+
+    // We expect an Ok result since the filter checked the key exists, None means the auth flow ran out of time
+    let Ok(Some(auth_state)) = cache.get::<AuthRequestData>(&state) else {
+        return res
+            .status_code(StatusCode::REQUEST_TIMEOUT)
+            .render(Text::Plain("Authentication flow took too long to complete"));
+    };
+
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
-        .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier))
-        .request(http_client)
+        .expect("Code to be present")
+        .set_pkce_verifier(PkceCodeVerifier::new(auth_state.pkce_token))
+        .request(&http_client)
         .unwrap();
+
+    let id_token = token_response.id_token().unwrap().to_owned();
+    let id_token_verifier = client.id_token_verifier();
+
+    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_state.nonce) else {
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Unable to verify Id Token"));
+    };
+
+    if let Some(expected_access_token_hash) = claims.access_token_hash() {
+        let actual_access_token_hash = AccessTokenHash::from_token(
+            token_response.access_token(),
+            id_token.signing_alg().unwrap(),
+            id_token.signing_key(&id_token_verifier).unwrap(),
+        )
+        .expect("Token Hash to be constructed");
+        if actual_access_token_hash != *expected_access_token_hash {
+            return res
+                .status_code(StatusCode::UNAUTHORIZED)
+                .render(Text::Plain("Invalid Access Token"));
+        }
+    }
 
     let access_token = token_response.access_token().secret().to_owned();
     let refresh_token = token_response.refresh_token().unwrap().secret().to_owned();
 
     res.add_cookie(
         Cookie::build((ACCESS_TOKEN_COOKIE_NAME, access_token))
+            .secure(headers.https)
+            .http_only(true)
+            .build(),
+    );
+
+    res.add_cookie(
+        Cookie::build((ID_TOKEN_COOKIE_NAME, id_token.to_string()))
             .secure(headers.https)
             .http_only(true)
             .build(),
@@ -296,7 +370,6 @@ async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
     );
 
     res.remove_cookie(STATE_COOKIE_NAME);
-    res.remove_cookie(PKCS_COOKIE_NAME);
 
     // Todo: redirect to the page vistited before
     res.render(Redirect::temporary(format!(
@@ -329,11 +402,18 @@ async fn apply_oauth2_client(req: &mut Request, res: &mut Response, depot: &mut 
         }
     };
 
-    let provider_metadata =
-        CoreProviderMetadata::discover(&oidc_provider.clone().issuer_url, http_client).unwrap();
+    let http_client = reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Htttp Client to build");
 
-    let client = CoreClient::from_provider_metadata(
-        provider_metadata,
+    let provider_metadata =
+        CoreProviderMetadata::discover_async(oidc_provider.clone().issuer_url, &http_client)
+            .await
+            .unwrap();
+
+    let client: InitializedClient = CoreClient::from_provider_metadata(
+        provider_metadata.clone(),
         oidc_provider.client_id.to_owned(),
         Some(oidc_provider.client_secret.to_owned()),
     )
@@ -349,7 +429,7 @@ async fn apply_oauth2_client(req: &mut Request, res: &mut Response, depot: &mut 
     );
 
     depot.inject(forward_headers.clone());
-    depot.inject(client);
+    depot.inject((client, provider_metadata.authorization_endpoint().clone()));
     depot.inject(oidc_provider.scopes.clone());
 }
 
@@ -361,6 +441,12 @@ async fn main() {
         Ok(val) => !(val.to_lowercase().eq("true") || val.eq("1")),
         Err(_) => true,
     };
+
+    let store = TinyKV::open("cache.json")
+        .expect("cache file to be accessible")
+        .with_auto_save();
+
+    CACHE.get_or_init(move || RwLock::new(store));
 
     let oidc_providers = OIDCProviders::new().await;
     PROVIDERS.get_or_init(move || oidc_providers);

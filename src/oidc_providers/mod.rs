@@ -6,7 +6,7 @@ use jsonwebtoken::jwk::JwkSet;
 use k8s_ingress_providers::K8sIngressProvider;
 use kube::Error;
 use openidconnect::core::CoreProviderMetadata;
-use openidconnect::reqwest::async_http_client;
+use openidconnect::reqwest;
 use openidconnect::{ClientId, ClientSecret, IssuerUrl, Scope};
 use tracing::{debug, info, warn};
 
@@ -28,9 +28,14 @@ impl OIDCProvider {
         scopes: String,
         audience: String,
     ) -> Self {
+        let http_client = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("HttpClient Should Build");
+
         let provider_metadata = CoreProviderMetadata::discover_async(
             IssuerUrl::new(issuer_url.to_owned()).expect("Invalid issuer URL"),
-            async_http_client,
+            &http_client,
         )
         .await
         .unwrap();
