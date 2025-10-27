@@ -4,12 +4,18 @@ mod salvo_utils;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode as jwt_decode, decode_header, DecodingKey, Validation};
 use oidc_providers::OIDCProviders;
-use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
-use openidconnect::{reqwest, EndpointMaybeSet, EndpointNotSet, EndpointSet};
+use openidconnect::core::{
+    CoreClient, CoreGenderClaim, CoreIdToken, CoreProviderMetadata, CoreResponseType,
+};
+use openidconnect::{
+    reqwest, AdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet,
+    IdTokenClaims, StandardClaims,
+};
 use openidconnect::{
     AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
 };
+use parking_lot::RwLock;
 use salvo::http::cookie::Cookie;
 use salvo::http::{HeaderValue, StatusCode};
 use salvo::logging::Logger;
@@ -21,7 +27,7 @@ use salvo::{Listener, Service};
 use salvo_utils::{get_cookie, get_header, get_query_param, security_middleware};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 use tinykv::TinyKV;
 use tracing::{debug, info, warn};
 use urlencoding::decode;
@@ -31,7 +37,7 @@ static CACHE: OnceLock<RwLock<TinyKV>> = OnceLock::new();
 static ACCESS_TOKEN_COOKIE_NAME: &str = "x_oidc_access_token";
 static ID_TOKEN_COOKIE_NAME: &str = "x_oidc_id_token";
 static REFRESH_TOKEN_COOKIE_NAME: &str = "x_oidc_refresh_token";
-static STATE_COOKIE_NAME: &str = "x_oidc_csrf";
+static SESSION_COOKIE_NAME: &str = "x_oidc_session";
 
 pub type InitializedClient = CoreClient<
     EndpointSet,
@@ -47,6 +53,24 @@ struct AuthRequestData {
     pub pkce_token: String,
     pub nonce: Nonce,
 }
+
+#[derive(Serialize, Deserialize)]
+struct AuthData {
+    pub subject: String,
+    pub name: Option<String>,
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub groups: Option<Vec<String>>,
+}
+
+/// No additional claims.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+// In order to support serde flatten, this must be an empty struct rather than an empty
+// tuple struct.
+pub struct GroupAdditionalClaims {
+    pub groups: Option<Vec<String>>,
+}
+impl AdditionalClaims for GroupAdditionalClaims {}
 
 #[derive(Clone, Debug)]
 struct ForwardAuthHeaders {
@@ -78,19 +102,12 @@ async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mu
         nonce,
     };
 
-    let mut cache_write = CACHE.get().unwrap().write().expect("Write to be Aquired");
+    let mut cache_write = CACHE.get().unwrap().write();
 
     // TODO: Add auth timeout
     cache_write
         .set(csrf_state.secret(), auth_request_data)
         .expect("Cache write to succeed");
-
-    res.add_cookie(
-        Cookie::build((STATE_COOKIE_NAME, csrf_state.secret().to_string()))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
 
     debug!("Redirecting client to {}", authorize_url.to_string());
 
@@ -111,18 +128,26 @@ struct Claims {
 #[handler]
 async fn ok_handler(req: &mut Request, res: &mut Response) {
     let headers = res.headers_mut();
-    let sub_header = req.headers().get("X-Forwarded-User");
 
-    // Depot would be better, but check_cookie middleware does not support it
-    // TODO: Fix with actix migration
+    if let Some(user) = req.headers().get("X-Forwarded-User") {
+        debug!("X-Forwarded-User: {}", &user.to_str().unwrap());
+        headers.insert("X-Forwarded-User", user.to_owned());
+    }
 
-    if sub_header.is_some() {
-        debug!(
-            "X-Forwarded-User: {}",
-            &sub_header.clone().unwrap().to_str().unwrap()
-        );
+    if let Some(username) = req.headers().get("X-Forwarded-Username") {
+        debug!("X-Forwarded-Username: {}", &username.to_str().unwrap());
+        // headers.insert("X-Forwarded-Username", username.to_owned());
+        headers.insert("X-Forwarded-Username", HeaderValue::from_str("CEbbinghaus").unwrap());
+    }
 
-        headers.insert("X-Forwarded-User", sub_header.unwrap().to_owned());
+    if let Some(email) = req.headers().get("X-Forwarded-Email") {
+        debug!("X-Forwarded-Email: {}", &email.to_str().unwrap());
+        headers.insert("X-Forwarded-Email", email.to_owned());
+    }
+
+    if let Some(name) = req.headers().get("X-Forwarded-Name") {
+        debug!("X-Forwarded-Name: {}", &name.to_str().unwrap());
+        headers.insert("X-Forwarded-Name", name.to_owned());
     }
 
     res.status_code(StatusCode::NO_CONTENT);
@@ -212,72 +237,68 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 // TODO: Refactor from path check to middleware
 fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
     let hostname = get_header(req, "x-forwarded-host");
-    let token = get_cookie(req, ACCESS_TOKEN_COOKIE_NAME);
+    // let token = get_cookie(req, ID_TOKEN_COOKIE_NAME);
+    let session_id = get_cookie(req, SESSION_COOKIE_NAME);
 
-    if token.is_empty() {
-        debug!("Cookie key {} is empty.", ACCESS_TOKEN_COOKIE_NAME);
+    if session_id.is_empty() {
+        debug!("cookie {} had no value", SESSION_COOKIE_NAME);
         return false;
     }
+    // if token.is_empty() {
+    //     debug!("Cookie key {} is empty.", ID_TOKEN_COOKIE_NAME);
+    //     return false;
+    // }
 
-    debug!("Received cookie value: {}", &token);
+    debug!("Received cookie value: {}", &session_id);
 
-    let oidc_provider = match PROVIDERS.get().unwrap().find_by_hostname(&hostname) {
-        Some(val) => val,
-        None => {
-            debug!("OIDC provider not found for hostname {}.", &hostname);
-            return false;
-        }
-    };
+    // let oidc_provider = match PROVIDERS.get().unwrap().find_by_hostname(&hostname) {
+    //     Some(val) => val,
+    //     None => {
+    //         debug!("OIDC provider not found for hostname {}.", &hostname);
+    //         return false;
+    //     }
+    // };
 
-    let header = match decode_header(&token) {
-        Ok(val) => val,
-        Err(_) => {
-            debug!("Error when decoding headers of token: {}", &token);
-            return false;
-        }
-    };
+    let mut cache = CACHE.get().unwrap().write();
 
-    let key_id = header.kid.unwrap();
-    debug!("Token JWK Key ID: {}", &key_id);
-
-    let jwks: JwkSet = oidc_provider.clone().jwks;
-    let jwk: &jsonwebtoken::jwk::Jwk = match jwks.keys.iter().find(|k| {
-        k.common
-            .key_id
-            .as_ref()
-            .is_some_and(|s| s.eq(key_id.as_str()))
-    }) {
-        Some(val) => val,
-        _ => return false,
-    };
-
-    let key = DecodingKey::from_jwk(&jwk).unwrap();
-    let mut validation = Validation::new(header.alg);
-
-    validation.set_audience(&oidc_provider.audience.clone());
-    validation.set_issuer(&vec![oidc_provider.issuer_url.clone().as_str()]);
-
-    let claims = jwt_decode::<Claims>(&token, &key, &validation);
-
-    if !claims.is_ok() {
+    let Ok(cache_value) = cache.get::<AuthData>(&session_id) else {
+        debug!("Session id does not exist {}.", &session_id);
         return false;
-    }
+    };
 
-    let sub = claims.unwrap().claims.sub;
+    let Some(auth_data) = cache_value else {
+        debug!("Session existed but is no longer value {}.", &session_id);
+        return false;
+    };
 
-    // Does not work in PathFilter :/
-    // depot.inject::<Claims>(myclaims);
-
-    // So we pass it via the request header
     let headers = req.headers_mut();
-    headers.insert("X-Forwarded-User", HeaderValue::from_str(&sub).unwrap());
+
+    headers.insert(
+        "X-Forwarded-User",
+        HeaderValue::from_str(&auth_data.subject).unwrap(),
+    );
+
+    if let Some(username) = &auth_data.username {
+        headers.insert(
+            "X-Forwarded-Username",
+            HeaderValue::from_str(username).unwrap(),
+        );
+    }
+
+    if let Some(email) = &auth_data.email {
+        headers.insert("X-Forwarded-Email", HeaderValue::from_str(email).unwrap());
+    }
+
+    if let Some(name) = &auth_data.name {
+        headers.insert("X-Forwarded-Name", HeaderValue::from_str(name).unwrap());
+    }
 
     return true;
 }
 
 fn check_params(req: &mut Request, _state: &mut PathState) -> bool {
     let uri = get_header(req, "x-forwarded-uri");
-    let cache_read = CACHE.get().unwrap().read().expect("Cache to be readable");
+    let cache_read = CACHE.get().unwrap().read();
     let state = get_query_param(&uri, "state");
     let code = get_query_param(&uri, "code");
 
@@ -288,11 +309,11 @@ fn check_params(req: &mut Request, _state: &mut PathState) -> bool {
 }
 
 #[handler]
-fn set_cookie(res: &mut Response, depot: &mut Depot) {
+async fn set_cookie(res: &mut Response, depot: &mut Depot) {
     let client = depot.obtain::<InitializedClient>().unwrap();
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
 
-    let http_client = reqwest::blocking::ClientBuilder::new()
+    let http_client = reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("Htttp Client to build");
@@ -306,7 +327,7 @@ fn set_cookie(res: &mut Response, depot: &mut Depot) {
 
     let state = get_query_param(&headers.uri, "state");
 
-    let mut cache = CACHE.get().unwrap().write().expect("Cache to be writable");
+    let mut cache = CACHE.get().unwrap().write();
 
     // We expect an Ok result since the filter checked the key exists, None means the auth flow ran out of time
     let Ok(Some(auth_state)) = cache.get::<AuthRequestData>(&state) else {
@@ -319,7 +340,8 @@ fn set_cookie(res: &mut Response, depot: &mut Depot) {
         .exchange_code(AuthorizationCode::new(code))
         .expect("Code to be present")
         .set_pkce_verifier(PkceCodeVerifier::new(auth_state.pkce_token))
-        .request(&http_client)
+        .request_async(&http_client)
+        .await
         .unwrap();
 
     let id_token = token_response.id_token().unwrap().to_owned();
@@ -348,6 +370,37 @@ fn set_cookie(res: &mut Response, depot: &mut Depot) {
     let access_token = token_response.access_token().secret().to_owned();
     let refresh_token = token_response.refresh_token().unwrap().secret().to_owned();
 
+    cache.remove(&state).expect("Remove to succeed");
+
+    let validity_period = claims
+        .expiration()
+        .signed_duration_since(k8s_openapi::chrono::Local::now());
+
+    if validity_period.num_seconds() < 0 {
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Token has expireds"));
+    }
+
+    cache.set_with_ttl(
+        &state,
+        AuthData {
+            subject: claims.subject().to_string(),
+            email: claims.email().map(|v| v.to_string()),
+            name: claims.name().map(|v| v.get(None).unwrap().to_string()),
+            username: claims.preferred_username().map(|v| v.to_string()),
+            groups: None,
+        },
+        validity_period.num_seconds() as u64,
+    ).expect("Save to succeed");
+
+    res.add_cookie(
+        Cookie::build((SESSION_COOKIE_NAME, state))
+            .secure(headers.https)
+            .http_only(true)
+            .build(),
+    );
+
     res.add_cookie(
         Cookie::build((ACCESS_TOKEN_COOKIE_NAME, access_token))
             .secure(headers.https)
@@ -368,8 +421,6 @@ fn set_cookie(res: &mut Response, depot: &mut Depot) {
             .http_only(true)
             .build(),
     );
-
-    res.remove_cookie(STATE_COOKIE_NAME);
 
     // Todo: redirect to the page vistited before
     res.render(Redirect::temporary(format!(
@@ -429,7 +480,7 @@ async fn apply_oauth2_client(req: &mut Request, res: &mut Response, depot: &mut 
     );
 
     depot.inject(forward_headers.clone());
-    depot.inject((client, provider_metadata.authorization_endpoint().clone()));
+    depot.inject(client);
     depot.inject(oidc_provider.scopes.clone());
 }
 
