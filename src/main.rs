@@ -1,6 +1,7 @@
 mod oidc_providers;
 mod salvo_utils;
 
+use k8s_openapi::chrono::{DateTime, Duration, Utc};
 use oidc_providers::OIDCProviders;
 use openidconnect::core::{
     CoreClient, CoreProviderMetadata, CoreResponseType,
@@ -26,14 +27,11 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::OnceLock;
 use tinykv::TinyKV;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use urlencoding::decode;
 
 static PROVIDERS: OnceLock<OIDCProviders> = OnceLock::new();
 static CACHE: OnceLock<RwLock<TinyKV>> = OnceLock::new();
-static ACCESS_TOKEN_COOKIE_NAME: &str = "x_oidc_access_token";
-static ID_TOKEN_COOKIE_NAME: &str = "x_oidc_id_token";
-static REFRESH_TOKEN_COOKIE_NAME: &str = "x_oidc_refresh_token";
 static SESSION_COOKIE_NAME: &str = "x_oidc_session";
 
 pub type InitializedClient = CoreClient<
@@ -54,6 +52,9 @@ struct AuthRequestData {
 #[derive(Serialize, Deserialize)]
 struct AuthData {
     pub nonce: Nonce,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_token_exp: DateTime<Utc>,
     pub subject: String,
     pub name: Option<String>,
     pub username: Option<String>,
@@ -77,6 +78,9 @@ struct ForwardAuthHeaders {
     host: String,
     uri: String,
 }
+
+const SESSION_DURATION: Duration = Duration::new(5 * 60 * 60, 0).unwrap();
+const ACCESS_TOKEN_REFRESH_LEAD: Duration = Duration::new(5 * 60, 0).unwrap();
 
 #[handler]
 async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mut Depot) {
@@ -117,49 +121,53 @@ async fn status_handler(res: &mut Response) {
     res.status_code(StatusCode::NO_CONTENT);
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-}
-
 #[handler]
 async fn ok_handler(req: &mut Request, res: &mut Response) {
     let headers = res.headers_mut();
 
     if let Some(user) = req.headers().get("X-Forwarded-User") {
-        debug!("X-Forwarded-User: {}", &user.to_str().unwrap());
+        trace!("X-Forwarded-User: {}", &user.to_str().unwrap());
         headers.insert("X-Forwarded-User", user.to_owned());
     }
 
     if let Some(username) = req.headers().get("X-Forwarded-Username") {
-        debug!("X-Forwarded-Username: {}", &username.to_str().unwrap());
+        trace!("X-Forwarded-Username: {}", &username.to_str().unwrap());
         headers.insert("X-Forwarded-Username", username.to_owned());
     }
 
     if let Some(email) = req.headers().get("X-Forwarded-Email") {
-        debug!("X-Forwarded-Email: {}", &email.to_str().unwrap());
+        trace!("X-Forwarded-Email: {}", &email.to_str().unwrap());
         headers.insert("X-Forwarded-Email", email.to_owned());
     }
 
     if let Some(name) = req.headers().get("X-Forwarded-Name") {
-        debug!("X-Forwarded-Name: {}", &name.to_str().unwrap());
+        trace!("X-Forwarded-Name: {}", &name.to_str().unwrap());
         headers.insert("X-Forwarded-Name", name.to_owned());
     }
 
     res.status_code(StatusCode::NO_CONTENT);
 }
 
-fn has_refresh_token(req: &mut Request, _state: &mut PathState) -> bool {
-    let refresh_token = get_cookie(req, REFRESH_TOKEN_COOKIE_NAME);
+fn requires_refresh(req: &mut Request, _state: &mut PathState) -> bool {
+    let session_token = get_cookie(req, SESSION_COOKIE_NAME);
 
-    !refresh_token.is_empty()
+    let auth_data = {
+        let mut cache = CACHE.get().unwrap().write();
+
+        let Ok(Some(auth_data)) = cache.get::<AuthData>(&session_token) else {
+            debug!("Session {session_token} has expired or is no longer valid");
+            return false;
+        };
+
+        auth_data
+    };  
+    
+    auth_data.access_token_exp < Utc::now()
 }
 
 #[handler]
 async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut Depot) {
     let session = &get_cookie(req, SESSION_COOKIE_NAME);
-
     if session.is_empty() {
         debug!("Session cookie was empty");
         return res
@@ -167,9 +175,20 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
             .render(Text::Plain("No active Session."));
     }
 
-    let refresh_token = decode(&get_cookie(req, REFRESH_TOKEN_COOKIE_NAME))
-        .unwrap()
-        .to_string();
+    debug!("Renewing Access Token for session {}", session);
+
+   let auth_data = {
+        let mut cache = CACHE.get().unwrap().write();
+
+        let Ok(Some(auth_data)) = cache.get::<AuthData>(session) else {
+            debug!("Session {session} has expired or is no longer valid");
+            return res
+                .status_code(StatusCode::UNAUTHORIZED)
+                .render(Text::Plain("Invalid Session"));
+        };
+
+        auth_data
+    };
 
     let http_client = reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
@@ -180,8 +199,8 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
 
-    let token_response = match client
-        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_owned()))
+    let token_response: openidconnect::StandardTokenResponse<openidconnect::IdTokenFields<openidconnect::EmptyAdditionalClaims, openidconnect::EmptyExtraTokenFields, openidconnect::core::CoreGenderClaim, openidconnect::core::CoreJweContentEncryptionAlgorithm, openidconnect::core::CoreJwsSigningAlgorithm>, openidconnect::core::CoreTokenType> = match client
+        .exchange_refresh_token(&RefreshToken::new(auth_data.refresh_token.to_owned()))
         .expect("Refresh token to be valid")
         .add_scopes(scopes) // TODO: Test if required
         .request_async(&http_client)
@@ -189,12 +208,11 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
     {
         Ok(v) => v,
         Err(err) => {
-            debug!("Refresh token: {}", &refresh_token);
+            debug!("Refresh token: {}", auth_data.refresh_token);
             warn!("Error exchanging refresh token: {}", err);
 
-            // If the token is invalid, remove the cookie and try again.
             // TODO: Directly redirect to forward_auth_handler
-            res.remove_cookie(REFRESH_TOKEN_COOKIE_NAME);
+            // forward_auth_handler.(req, res, depot).await;
             res.render(Redirect::temporary(format!(
                 "{}://{}/{}",
                 headers.protocol,
@@ -218,18 +236,8 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
         res.status_code(StatusCode::UNAUTHORIZED);
     }
 
-    let mut cache = CACHE.get().unwrap().write();
-
-    let Ok(Some(auth_data)) = cache.get::<AuthData>(session) else {
-        debug!("Session {session} has expired or is no longer valid");
-        return res
-            .status_code(StatusCode::UNAUTHORIZED)
-            .render(Text::Plain("Invalid Session"));
-    };
-
     let id_token_verifier = client.id_token_verifier();
     let id_token= token_response.id_token().expect("IdToken to exist");
-
 
     let Ok(claims) = id_token.claims(&id_token_verifier, &auth_data.nonce) else {
         warn!("Unable to verify id_token '{}'", id_token.to_string());
@@ -237,32 +245,15 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
             .status_code(StatusCode::UNAUTHORIZED)
             .render(Text::Plain("Invalid id_token"));
     };
-    
-    let validity_period = claims
-        .expiration()
-        .signed_duration_since(k8s_openapi::chrono::Local::now());
 
-    if validity_period.num_seconds() < 0 {
-        return res
-            .status_code(StatusCode::UNAUTHORIZED)
-            .render(Text::Plain("Token has expireds"));
-    }    
+    let mut cache = CACHE.get().unwrap().write();
 
-    cache.set_with_ttl(&session, auth_data, validity_period.num_seconds() as u64).expect("Writing to succeed");
-
-    res.add_cookie(
-        Cookie::build((ACCESS_TOKEN_COOKIE_NAME, access_token.to_owned()))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
-
-    res.add_cookie(
-        Cookie::build((REFRESH_TOKEN_COOKIE_NAME, refresh_token))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
+    cache.set_with_ttl(&session, AuthData {
+        access_token,
+        refresh_token,
+        access_token_exp: claims.expiration() - ACCESS_TOKEN_REFRESH_LEAD,
+        ..auth_data
+    }, SESSION_DURATION.num_seconds() as u64).expect("Writing to succeed");
 
     res.render(Redirect::temporary(format!(
         "{}://{}/{}",
@@ -274,38 +265,21 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
 // TODO: Refactor from path check to middleware
 fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
-    // let hostname = get_header(req, "x-forwarded-host");
-    // let token = get_cookie(req, ID_TOKEN_COOKIE_NAME);
     let session_id = get_cookie(req, SESSION_COOKIE_NAME);
-
     if session_id.is_empty() {
-        debug!("cookie {} had no value", SESSION_COOKIE_NAME);
+        debug!("unauthenticated request received");
         return false;
     }
-    // if token.is_empty() {
-    //     debug!("Cookie key {} is empty.", ID_TOKEN_COOKIE_NAME);
-    //     return false;
-    // }
-
-    debug!("Received cookie value: {}", &session_id);
-
-    // let oidc_provider = match PROVIDERS.get().unwrap().find_by_hostname(&hostname) {
-    //     Some(val) => val,
-    //     None => {
-    //         debug!("OIDC provider not found for hostname {}.", &hostname);
-    //         return false;
-    //     }
-    // };
 
     let mut cache = CACHE.get().unwrap().write();
 
     let Ok(cache_value) = cache.get::<AuthData>(&session_id) else {
-        debug!("Session id does not exist {}.", &session_id);
+        debug!("Session id does not exist in the local cache {}.", &session_id);
         return false;
     };
 
     let Some(auth_data) = cache_value else {
-        debug!("Session existed but is no longer value {}.", &session_id);
+        debug!("Session existed but is no longer active {}.", &session_id);
         return false;
     };
 
@@ -354,7 +328,7 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
     let http_client = reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("Htttp Client to build");
+        .expect("Http Client to build");
 
     let code = get_query_param(&headers.uri, "code");
     if code.is_empty() {
@@ -410,52 +384,24 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
 
     cache.remove(&state).expect("Remove to succeed");
 
-    let validity_period = claims
-        .expiration()
-        .signed_duration_since(k8s_openapi::chrono::Local::now());
-
-    if validity_period.num_seconds() < 0 {
-        return res
-            .status_code(StatusCode::UNAUTHORIZED)
-            .render(Text::Plain("Token has expireds"));
-    }
-
     cache.set_with_ttl(
         &state,
         AuthData {
             nonce: auth_state.nonce,
+            access_token,
+            refresh_token,
+            access_token_exp: claims.expiration() - ACCESS_TOKEN_REFRESH_LEAD,
             subject: claims.subject().to_string(),
             email: claims.email().map(|v| v.to_string()),
             name: claims.name().map(|v| v.get(None).unwrap().to_string()),
             username: claims.preferred_username().map(|v| v.to_string()),
             groups: None,
         },
-        validity_period.num_seconds() as u64,
+        SESSION_DURATION.num_seconds() as u64,
     ).expect("Save to succeed");
 
     res.add_cookie(
         Cookie::build((SESSION_COOKIE_NAME, state))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
-
-    res.add_cookie(
-        Cookie::build((ACCESS_TOKEN_COOKIE_NAME, access_token))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
-
-    res.add_cookie(
-        Cookie::build((ID_TOKEN_COOKIE_NAME, id_token.to_string()))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
-
-    res.add_cookie(
-        Cookie::build((REFRESH_TOKEN_COOKIE_NAME, refresh_token))
             .secure(headers.https)
             .http_only(true)
             .build(),
@@ -556,7 +502,7 @@ async fn main() {
                     }
                 })
                 .push(Router::with_filter_fn(check_cookie).goal(ok_handler))
-                .push(Router::with_filter_fn(has_refresh_token).goal(renew_access_token))
+                .push(Router::with_filter_fn(requires_refresh).goal(renew_access_token))
                 .push(Router::with_filter_fn(check_params).goal(set_cookie))
                 .push(Router::new().goal(forward_auth_handler)),
         );
