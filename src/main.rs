@@ -1,16 +1,15 @@
 mod oidc_providers;
 mod salvo_utils;
 
+use base64::prelude::*;
 use k8s_openapi::chrono::{DateTime, Duration, Utc};
 use oidc_providers::OIDCProviders;
-use serde_with::DurationSecondsWithFrac;
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{reqwest, AdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet};
 use openidconnect::{
     AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
 };
-use parking_lot::RwLock;
 use salvo::http::cookie::Cookie;
 use salvo::http::{HeaderValue, StatusCode};
 use salvo::logging::Logger;
@@ -21,15 +20,14 @@ use salvo::routing::PathState;
 use salvo::{Listener, Service};
 use salvo_utils::{get_cookie, get_header, get_query_param, security_middleware};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use serde_with::{DurationSecondsWithFrac, serde_as};
 use std::{env, fs, iter};
 use std::sync::OnceLock;
-use tinykv::TinyKV;
-use tracing::{debug, info, trace, warn, error};
+use tracing::{debug, error, info, trace, warn};
 use urlencoding::decode;
 
 static PROVIDERS: OnceLock<OIDCProviders> = OnceLock::new();
-static CACHE: OnceLock<RwLock<TinyKV>> = OnceLock::new();
+static AUTHREQUEST_COOKIE_NAME: &str = "x_oidc_authrequest";
 static SESSION_COOKIE_NAME: &str = "x_oidc_session";
 
 static CONFIGURATION: OnceLock<Configuration> = OnceLock::new();
@@ -62,16 +60,33 @@ impl Default for Configuration {
 
 impl<T> From<T> for Configuration
 where
-    T: IntoIterator<Item = OptionalConfiguration>
+    T: IntoIterator<Item = OptionalConfiguration>,
 {
     fn from(value: T) -> Self {
         let value = value.into_iter();
 
-        let configurations: Vec<OptionalConfiguration> = value.chain(iter::once(OptionalConfiguration::default())).collect();
+        let configurations: Vec<OptionalConfiguration> = value
+            .chain(iter::once(OptionalConfiguration::default()))
+            .collect();
         Configuration {
-            session_duration: configurations.iter().map(|v| v.session_duration).reduce(Option::or).flatten().unwrap(),
-            access_token_refresh_lead: configurations.iter().map(|v| v.access_token_refresh_lead).reduce(Option::or).flatten().unwrap(),
-            secret: configurations.iter().map(|v| v.secret.clone()).reduce(Option::or).flatten().unwrap(),
+            session_duration: configurations
+                .iter()
+                .map(|v| v.session_duration)
+                .reduce(Option::or)
+                .flatten()
+                .unwrap(),
+            access_token_refresh_lead: configurations
+                .iter()
+                .map(|v| v.access_token_refresh_lead)
+                .reduce(Option::or)
+                .flatten()
+                .unwrap(),
+            secret: configurations
+                .iter()
+                .map(|v| v.secret.clone())
+                .reduce(Option::or)
+                .flatten()
+                .unwrap(),
         }
     }
 }
@@ -104,6 +119,7 @@ impl From<Configuration> for OptionalConfiguration {
 
 #[derive(Serialize, Deserialize)]
 struct AuthRequestData {
+    pub csrf_state: String,
     pub pkce_token: String,
     pub nonce: Nonce,
 }
@@ -137,11 +153,67 @@ struct ForwardAuthHeaders {
     uri: String,
 }
 
+#[derive(Debug)]
+enum AuthDataError {
+    EmptySession,
+    InvalidBase64,
+    InvalidDeserialize,
+}
+
+fn set_response_by_auth_data_error(res: &mut Response, err: &AuthDataError) {
+    match err {
+        AuthDataError::EmptySession => res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("No active Session.")),
+        AuthDataError::InvalidBase64 => {
+            res.remove_cookie(SESSION_COOKIE_NAME);
+            res.status_code(StatusCode::UNAUTHORIZED)
+                .render(Text::Plain("Invalid Session"));
+        }
+        AuthDataError::InvalidDeserialize => {
+            res.remove_cookie(SESSION_COOKIE_NAME);
+            res.status_code(StatusCode::UNAUTHORIZED)
+                .render(Text::Plain("Invalid Session"));
+        }
+    }
+}
+
+fn get_auth_data_from_request(req: &mut Request) -> Result<AuthData, AuthDataError> {
+    let session = get_cookie(req, SESSION_COOKIE_NAME);
+    if session.is_empty() {
+        debug!("Session cookie was empty");
+        return Err(AuthDataError::EmptySession);
+    }
+
+    debug!("Renewing Access Token for session {session}");
+
+    let auth_data_value = match BASE64_STANDARD.decode(&session) {
+        Ok(v) => v,
+        Err(err) => {
+            error!(
+                "Unable to decode session cookie {session} {}",
+                err.to_string()
+            );
+            return Err(AuthDataError::InvalidBase64);
+        }
+    };
+
+    let auth_data: AuthData = match bincode2::deserialize(&auth_data_value) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Unable to deserialize cookie {session} {}", err.to_string());
+            return Err(AuthDataError::InvalidDeserialize);
+        }
+    };
+
+    Ok(auth_data)
+}
+
 #[handler]
 async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mut Depot) {
     let client = depot.obtain::<InitializedClient>().unwrap().clone();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
-    // let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
+    let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let (authorize_url, csrf_state, nonce) = client
@@ -155,16 +227,31 @@ async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mu
         .url();
 
     let auth_request_data = AuthRequestData {
+        csrf_state: csrf_state.into_secret(),
         pkce_token: pkce_verifier.secret().clone(),
         nonce,
     };
 
-    let mut cache_write = CACHE.get().unwrap().write();
+    let data = match bincode2::serialize(&auth_request_data) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Failed to serialize auth data: {}", err.to_string());
+            return res
+                .status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .render(Text::Plain("Unable to serialize auth data"));
+        }
+    };
 
-    // TODO: Add auth timeout
-    cache_write
-        .set(csrf_state.secret(), auth_request_data)
-        .expect("Cache write to succeed");
+    //TODO: Encrypt data
+
+    let cookie_value = BASE64_STANDARD.encode(data);
+
+    res.add_cookie(
+        Cookie::build((AUTHREQUEST_COOKIE_NAME, cookie_value))
+            .http_only(headers.https)
+            .secure(true)
+            .build(),
+    );
 
     debug!("Redirecting client to {}", authorize_url.to_string());
 
@@ -204,17 +291,11 @@ async fn ok_handler(req: &mut Request, res: &mut Response) {
 }
 
 fn requires_refresh(req: &mut Request, _state: &mut PathState) -> bool {
-    let session_token = get_cookie(req, SESSION_COOKIE_NAME);
-
-    let auth_data = {
-        let mut cache = CACHE.get().unwrap().write();
-
-        let Ok(Some(auth_data)) = cache.get::<AuthData>(&session_token) else {
-            debug!("Session {session_token} has expired or is no longer valid");
+    let auth_data = match get_auth_data_from_request(req) {
+        Ok(v) => v,
+        Err(_) => {
             return false;
-        };
-
-        auth_data
+        }
     };
 
     auth_data.access_token_exp < Utc::now()
@@ -222,7 +303,7 @@ fn requires_refresh(req: &mut Request, _state: &mut PathState) -> bool {
 
 #[handler]
 async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut Depot) {
-    let session = &get_cookie(req, SESSION_COOKIE_NAME);
+    let session = get_cookie(req, SESSION_COOKIE_NAME);
     if session.is_empty() {
         debug!("Session cookie was empty");
         return res
@@ -232,17 +313,11 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
     debug!("Renewing Access Token for session {session}");
 
-    let auth_data = {
-        let mut cache = CACHE.get().unwrap().write();
-
-        let Ok(Some(auth_data)) = cache.get::<AuthData>(session) else {
-            debug!("Session {session} has expired or is no longer valid");
-            return res
-                .status_code(StatusCode::UNAUTHORIZED)
-                .render(Text::Plain("Invalid Session"));
-        };
-
-        auth_data
+    let auth_data = match get_auth_data_from_request(req) {
+        Ok(v) => v,
+        Err(err) => {
+            return set_response_by_auth_data_error(res, &err);
+        }
     };
 
     let http_client = reqwest::ClientBuilder::new()
@@ -310,19 +385,31 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
             .render(Text::Plain("Invalid id_token"));
     };
 
-    let mut cache = CACHE.get().unwrap().write();
+    let data = match bincode2::serialize(&AuthData {
+        refresh_token,
+        access_token_exp: claims.expiration()
+            - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+        ..auth_data
+    }) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Failed to serialize auth data: {}", err.to_string());
+            return res
+                .status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .render(Text::Plain("Unable to serialize auth data"));
+        }
+    };
 
-    cache
-        .set_with_ttl(
-            &session,
-            AuthData {
-                refresh_token,
-                access_token_exp: claims.expiration() - CONFIGURATION.get().unwrap().access_token_refresh_lead,
-                ..auth_data
-            },
-            CONFIGURATION.get().unwrap().session_duration.num_seconds() as u64,
-        )
-        .expect("Writing to succeed");
+    //TODO: Encrypt data
+
+    let cookie_value = BASE64_STANDARD.encode(data);
+
+    res.add_cookie(
+        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
+            .secure(headers.https)
+            .http_only(true)
+            .build(),
+    );
 
     res.render(Redirect::temporary(format!(
         "{}://{}/{}",
@@ -334,25 +421,18 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
 // TODO: Refactor from path check to middleware
 fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
-    let session_id = get_cookie(req, SESSION_COOKIE_NAME);
-    if session_id.is_empty() {
+    let session = get_cookie(req, SESSION_COOKIE_NAME);
+    if session.is_empty() {
         debug!("unauthenticated request received");
         return false;
     }
 
-    let mut cache = CACHE.get().unwrap().write();
-
-    let Ok(cache_value) = cache.get::<AuthData>(&session_id) else {
-        debug!(
-            "Session id does not exist in the local cache {}.",
-            &session_id
-        );
-        return false;
-    };
-
-    let Some(auth_data) = cache_value else {
-        debug!("Session existed but is no longer active {}.", &session_id);
-        return false;
+    let auth_data = match get_auth_data_from_request(req) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Unable to retrieve auth_data from cookie {err:?}");
+            return false;
+        }
     };
 
     let headers = req.headers_mut();
@@ -382,18 +462,30 @@ fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
 
 fn check_params(req: &mut Request, _state: &mut PathState) -> bool {
     let uri = get_header(req, "x-forwarded-uri");
-    let cache_read = CACHE.get().unwrap().read();
+    let authrequest_cookie = get_cookie(req, AUTHREQUEST_COOKIE_NAME);
     let state = get_query_param(&uri, "state");
     let code = get_query_param(&uri, "code");
+
+    if authrequest_cookie.is_empty() {
+        return false;
+    }
+
+    let Ok(decoded) = BASE64_STANDARD.decode(&authrequest_cookie) else {
+        return false;
+    };
+
+    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decoded) else {
+        return false;
+    };
 
     return !(uri.is_empty()
         || code.is_empty()
         || state.is_empty()
-        || !cache_read.contains_key(&state));
+        || auth_request.csrf_state != state);
 }
 
 #[handler]
-async fn set_cookie(res: &mut Response, depot: &mut Depot) {
+async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
     let client = depot.obtain::<InitializedClient>().unwrap();
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
 
@@ -409,21 +501,33 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
             .render(Text::Plain("No Token in response."));
     }
 
-    let state = get_query_param(&headers.uri, "state");
+    let authrequest_cookie = get_cookie(req, AUTHREQUEST_COOKIE_NAME);
 
-    let mut cache = CACHE.get().unwrap().write();
-
-    // We expect an Ok result since the filter checked the key exists, None means the auth flow ran out of time
-    let Ok(Some(auth_state)) = cache.get::<AuthRequestData>(&state) else {
+    if authrequest_cookie.is_empty() {
+        error!("Missing AuthRequest Cookie {AUTHREQUEST_COOKIE_NAME}");
         return res
-            .status_code(StatusCode::REQUEST_TIMEOUT)
-            .render(Text::Plain("Authentication flow took too long to complete"));
+            .status_code(StatusCode::BAD_REQUEST)
+            .render(Text::Plain("Missing Required Cookie"));
+    }
+
+    let Ok(decoded) = BASE64_STANDARD.decode(&authrequest_cookie) else {
+        error!("Unable to decode AuthRequest Cookie {authrequest_cookie}");
+        return res
+            .status_code(StatusCode::BAD_REQUEST)
+            .render(Text::Plain("Invalid Cookie"));
+    };
+
+    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decoded) else {
+        error!("Unable to Deserialize AuthRequest Cookie {authrequest_cookie}");
+        return res
+            .status_code(StatusCode::BAD_REQUEST)
+            .render(Text::Plain("Invalid Cookies"));
     };
 
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
         .expect("Code to be present")
-        .set_pkce_verifier(PkceCodeVerifier::new(auth_state.pkce_token))
+        .set_pkce_verifier(PkceCodeVerifier::new(auth_request.pkce_token))
         .request_async(&http_client)
         .await
         .unwrap();
@@ -431,7 +535,7 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
     let id_token = token_response.id_token().unwrap().to_owned();
     let id_token_verifier = client.id_token_verifier();
 
-    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_state.nonce) else {
+    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_request.nonce) else {
         return res
             .status_code(StatusCode::UNAUTHORIZED)
             .render(Text::Plain("Unable to verify Id Token"));
@@ -453,27 +557,34 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
 
     let refresh_token = token_response.refresh_token().unwrap().secret().to_owned();
 
-    cache.remove(&state).expect("Remove to succeed");
+    res.remove_cookie(AUTHREQUEST_COOKIE_NAME);
 
-    cache
-        .set_with_ttl(
-            &state,
-            AuthData {
-                nonce: auth_state.nonce,
-                refresh_token,
-                access_token_exp: claims.expiration() - CONFIGURATION.get().unwrap().access_token_refresh_lead,
-                subject: claims.subject().to_string(),
-                email: claims.email().map(|v| v.to_string()),
-                name: claims.name().map(|v| v.get(None).unwrap().to_string()),
-                username: claims.preferred_username().map(|v| v.to_string()),
-                groups: None,
-            },
-            CONFIGURATION.get().unwrap().session_duration.num_seconds() as u64,
-        )
-        .expect("Save to succeed");
+    let data = match bincode2::serialize(&AuthData {
+        nonce: auth_request.nonce,
+        refresh_token,
+        access_token_exp: claims.expiration()
+            - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+        subject: claims.subject().to_string(),
+        email: claims.email().map(|v| v.to_string()),
+        name: claims.name().map(|v| v.get(None).unwrap().to_string()),
+        username: claims.preferred_username().map(|v| v.to_string()),
+        groups: None,
+    }) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Failed to serialize auth data: {}", err.to_string());
+            return res
+                .status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .render(Text::Plain("Unable to serialize auth data"));
+        }
+    };
+
+    //TODO: Encrypt data
+
+    let cookie_value = BASE64_STANDARD.encode(data);
 
     res.add_cookie(
-        Cookie::build((SESSION_COOKIE_NAME, state))
+        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
             .secure(headers.https)
             .http_only(true)
             .build(),
@@ -562,22 +673,16 @@ async fn main() {
     let config: Configuration = vec![
         envy::from_env::<OptionalConfiguration>().expect("Parsing environment variables to work"),
         toml::from_str::<OptionalConfiguration>(&contents).expect("Parsing Config file to work"),
-    ].into();
-    
+    ]
+    .into();
+
     debug!("Loaded Configuration from ENV & File:\n{config:?}");
     CONFIGURATION.get_or_init(move || config);
-
 
     let enhanced_security_enabled = match env::var("DISABLE_ENHANCED_SECURITY") {
         Ok(val) => !(val.to_lowercase().eq("true") || val.eq("1")),
         Err(_) => true,
     };
-
-    let store = TinyKV::open("cache.json")
-        .expect("cache file to be accessible")
-        .with_auto_save();
-
-    CACHE.get_or_init(move || RwLock::new(store));
 
     let oidc_providers = OIDCProviders::new().await;
     PROVIDERS.get_or_init(move || oidc_providers);

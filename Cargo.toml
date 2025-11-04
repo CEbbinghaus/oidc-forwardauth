@@ -16,7 +16,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-tinykv = "0.4"
 urlencoding = "*"
 openidconnect = { version = "4.0.1", features = [
     "reqwest",
@@ -36,12 +35,12 @@ reqwest = { version = "0", features = [
     "rustls-tls",
 ], default-features = false }
 serde = "1"
-openssl = { version = "0", features = ["vendored"], default-features = false }
 tracing = "0"
 tracing-subscriber = "0.3"
 kube = { version = "0.93", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.22", features = ["latest"] }
-parking_lot = { version = "0.12.5", features = ["send_guard"] }
 toml = "0.9.8"
 envy = "0.4.2"
+bincode2 = "2.0.1"
 serde_with = { version = "3.15.1", features = ["chrono_0_4"] }
+base64 = "0.22.1"
