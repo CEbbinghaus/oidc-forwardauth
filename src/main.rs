@@ -3,12 +3,9 @@ mod salvo_utils;
 
 use k8s_openapi::chrono::{DateTime, Duration, Utc};
 use oidc_providers::OIDCProviders;
-use openidconnect::core::{
-    CoreClient, CoreProviderMetadata, CoreResponseType,
-};
-use openidconnect::{
-    reqwest, AdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet,
-};
+use serde_with::DurationSecondsWithFrac;
+use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
+use openidconnect::{reqwest, AdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet};
 use openidconnect::{
     AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
@@ -24,15 +21,18 @@ use salvo::routing::PathState;
 use salvo::{Listener, Service};
 use salvo_utils::{get_cookie, get_header, get_query_param, security_middleware};
 use serde::{Deserialize, Serialize};
-use std::env;
+use serde_with::serde_as;
+use std::{env, fs, iter};
 use std::sync::OnceLock;
 use tinykv::TinyKV;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace, warn, error};
 use urlencoding::decode;
 
 static PROVIDERS: OnceLock<OIDCProviders> = OnceLock::new();
 static CACHE: OnceLock<RwLock<TinyKV>> = OnceLock::new();
 static SESSION_COOKIE_NAME: &str = "x_oidc_session";
+
+static CONFIGURATION: OnceLock<Configuration> = OnceLock::new();
 
 pub type InitializedClient = CoreClient<
     EndpointSet,
@@ -43,6 +43,65 @@ pub type InitializedClient = CoreClient<
     EndpointMaybeSet,
 >;
 
+#[derive(Deserialize, Debug)]
+struct Configuration {
+    session_duration: Duration,
+    access_token_refresh_lead: Duration,
+    secret: String,
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Self {
+            session_duration: Duration::new(5 * 60 * 60, 0).unwrap(),
+            access_token_refresh_lead: Duration::new(5 * 60, 0).unwrap(),
+            secret: "SwrFnZSsti^tH6fY%j!h6o!MsA$jnlsKr!I%Zl1b!XzfMrmDdiWe2AjL@rhT0sOVHn1VJcd^&2nL&#xTqGXtmKjfSU5m61SzK6*OBQ13LONO1KhVHTaz0y#Ao8%qpQcz".to_string()
+        }
+    }
+}
+
+impl<T> From<T> for Configuration
+where
+    T: IntoIterator<Item = OptionalConfiguration>
+{
+    fn from(value: T) -> Self {
+        let value = value.into_iter();
+
+        let configurations: Vec<OptionalConfiguration> = value.chain(iter::once(OptionalConfiguration::default())).collect();
+        Configuration {
+            session_duration: configurations.iter().map(|v| v.session_duration).reduce(Option::or).flatten().unwrap(),
+            access_token_refresh_lead: configurations.iter().map(|v| v.access_token_refresh_lead).reduce(Option::or).flatten().unwrap(),
+            secret: configurations.iter().map(|v| v.secret.clone()).reduce(Option::or).flatten().unwrap(),
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct OptionalConfiguration {
+    #[serde_as(as = "Option<DurationSecondsWithFrac<String>>")]
+    session_duration: Option<Duration>,
+    #[serde_as(as = "Option<DurationSecondsWithFrac<String>>")]
+    access_token_refresh_lead: Option<Duration>,
+    secret: Option<String>,
+}
+
+impl Default for OptionalConfiguration {
+    fn default() -> Self {
+        Configuration::default().into()
+    }
+}
+
+impl From<Configuration> for OptionalConfiguration {
+    fn from(value: Configuration) -> Self {
+        OptionalConfiguration {
+            session_duration: Some(value.session_duration),
+            access_token_refresh_lead: Some(value.access_token_refresh_lead),
+            secret: Some(value.secret),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct AuthRequestData {
     pub pkce_token: String,
@@ -52,7 +111,6 @@ struct AuthRequestData {
 #[derive(Serialize, Deserialize)]
 struct AuthData {
     pub nonce: Nonce,
-    pub access_token: String,
     pub refresh_token: String,
     pub access_token_exp: DateTime<Utc>,
     pub subject: String,
@@ -78,9 +136,6 @@ struct ForwardAuthHeaders {
     host: String,
     uri: String,
 }
-
-const SESSION_DURATION: Duration = Duration::new(5 * 60 * 60, 0).unwrap();
-const ACCESS_TOKEN_REFRESH_LEAD: Duration = Duration::new(5 * 60, 0).unwrap();
 
 #[handler]
 async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mut Depot) {
@@ -160,8 +215,8 @@ fn requires_refresh(req: &mut Request, _state: &mut PathState) -> bool {
         };
 
         auth_data
-    };  
-    
+    };
+
     auth_data.access_token_exp < Utc::now()
 }
 
@@ -175,9 +230,9 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
             .render(Text::Plain("No active Session."));
     }
 
-    debug!("Renewing Access Token for session {}", session);
+    debug!("Renewing Access Token for session {session}");
 
-   let auth_data = {
+    let auth_data = {
         let mut cache = CACHE.get().unwrap().write();
 
         let Ok(Some(auth_data)) = cache.get::<AuthData>(session) else {
@@ -199,7 +254,16 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
     let headers = depot.obtain::<ForwardAuthHeaders>().unwrap();
     let scopes = depot.obtain::<Vec<Scope>>().unwrap().to_owned();
 
-    let token_response: openidconnect::StandardTokenResponse<openidconnect::IdTokenFields<openidconnect::EmptyAdditionalClaims, openidconnect::EmptyExtraTokenFields, openidconnect::core::CoreGenderClaim, openidconnect::core::CoreJweContentEncryptionAlgorithm, openidconnect::core::CoreJwsSigningAlgorithm>, openidconnect::core::CoreTokenType> = match client
+    let token_response: openidconnect::StandardTokenResponse<
+        openidconnect::IdTokenFields<
+            openidconnect::EmptyAdditionalClaims,
+            openidconnect::EmptyExtraTokenFields,
+            openidconnect::core::CoreGenderClaim,
+            openidconnect::core::CoreJweContentEncryptionAlgorithm,
+            openidconnect::core::CoreJwsSigningAlgorithm,
+        >,
+        openidconnect::core::CoreTokenType,
+    > = match client
         .exchange_refresh_token(&RefreshToken::new(auth_data.refresh_token.to_owned()))
         .expect("Refresh token to be valid")
         .add_scopes(scopes) // TODO: Test if required
@@ -237,7 +301,7 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
     }
 
     let id_token_verifier = client.id_token_verifier();
-    let id_token= token_response.id_token().expect("IdToken to exist");
+    let id_token = token_response.id_token().expect("IdToken to exist");
 
     let Ok(claims) = id_token.claims(&id_token_verifier, &auth_data.nonce) else {
         warn!("Unable to verify id_token '{}'", id_token.to_string());
@@ -248,12 +312,17 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
     let mut cache = CACHE.get().unwrap().write();
 
-    cache.set_with_ttl(&session, AuthData {
-        access_token,
-        refresh_token,
-        access_token_exp: claims.expiration() - ACCESS_TOKEN_REFRESH_LEAD,
-        ..auth_data
-    }, SESSION_DURATION.num_seconds() as u64).expect("Writing to succeed");
+    cache
+        .set_with_ttl(
+            &session,
+            AuthData {
+                refresh_token,
+                access_token_exp: claims.expiration() - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+                ..auth_data
+            },
+            CONFIGURATION.get().unwrap().session_duration.num_seconds() as u64,
+        )
+        .expect("Writing to succeed");
 
     res.render(Redirect::temporary(format!(
         "{}://{}/{}",
@@ -274,7 +343,10 @@ fn check_cookie(req: &mut Request, _state: &mut PathState) -> bool {
     let mut cache = CACHE.get().unwrap().write();
 
     let Ok(cache_value) = cache.get::<AuthData>(&session_id) else {
-        debug!("Session id does not exist in the local cache {}.", &session_id);
+        debug!(
+            "Session id does not exist in the local cache {}.",
+            &session_id
+        );
         return false;
     };
 
@@ -379,26 +451,26 @@ async fn set_cookie(res: &mut Response, depot: &mut Depot) {
         }
     }
 
-    let access_token = token_response.access_token().secret().to_owned();
     let refresh_token = token_response.refresh_token().unwrap().secret().to_owned();
 
     cache.remove(&state).expect("Remove to succeed");
 
-    cache.set_with_ttl(
-        &state,
-        AuthData {
-            nonce: auth_state.nonce,
-            access_token,
-            refresh_token,
-            access_token_exp: claims.expiration() - ACCESS_TOKEN_REFRESH_LEAD,
-            subject: claims.subject().to_string(),
-            email: claims.email().map(|v| v.to_string()),
-            name: claims.name().map(|v| v.get(None).unwrap().to_string()),
-            username: claims.preferred_username().map(|v| v.to_string()),
-            groups: None,
-        },
-        SESSION_DURATION.num_seconds() as u64,
-    ).expect("Save to succeed");
+    cache
+        .set_with_ttl(
+            &state,
+            AuthData {
+                nonce: auth_state.nonce,
+                refresh_token,
+                access_token_exp: claims.expiration() - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+                subject: claims.subject().to_string(),
+                email: claims.email().map(|v| v.to_string()),
+                name: claims.name().map(|v| v.get(None).unwrap().to_string()),
+                username: claims.preferred_username().map(|v| v.to_string()),
+                groups: None,
+            },
+            CONFIGURATION.get().unwrap().session_duration.num_seconds() as u64,
+        )
+        .expect("Save to succeed");
 
     res.add_cookie(
         Cookie::build((SESSION_COOKIE_NAME, state))
@@ -472,6 +544,29 @@ async fn apply_oauth2_client(req: &mut Request, res: &mut Response, depot: &mut 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    let config_file_path = std::env::var("CONFIG").unwrap_or("/data/config.toml".to_string());
+
+    if !fs::exists(&config_file_path).unwrap_or(false) {
+        error!("Config file at {config_file_path} doesn't exist");
+    }
+
+    let contents = match fs::read_to_string(config_file_path) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Unable to read config file \"{}\"", err.to_string());
+            panic!();
+        }
+    };
+
+    let config: Configuration = vec![
+        envy::from_env::<OptionalConfiguration>().expect("Parsing environment variables to work"),
+        toml::from_str::<OptionalConfiguration>(&contents).expect("Parsing Config file to work"),
+    ].into();
+    
+    debug!("Loaded Configuration from ENV & File:\n{config:?}");
+    CONFIGURATION.get_or_init(move || config);
+
 
     let enhanced_security_enabled = match env::var("DISABLE_ENHANCED_SECURITY") {
         Ok(val) => !(val.to_lowercase().eq("true") || val.eq("1")),

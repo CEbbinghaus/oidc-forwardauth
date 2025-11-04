@@ -43,5 +43,6 @@ RUN set -ex; \
 FROM scratch AS runtime
 COPY --from=builder /build /app
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/default_config.toml /data/config.toml
 EXPOSE 3000
 CMD ["/app"]
