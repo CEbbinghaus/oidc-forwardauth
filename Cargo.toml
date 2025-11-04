@@ -10,7 +10,7 @@ panic = "abort"   # Abort on panic
 strip = true      # Automatically strip symbols from the binary.
 
 [package]
-name = "oidc-forward-auth-middleware"
+name = "oidc-forwardauth"
 version = "0.3.0"
 edition = "2021"
 publish = false
