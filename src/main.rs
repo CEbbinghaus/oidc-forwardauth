@@ -1,6 +1,8 @@
 mod oidc_providers;
 mod salvo_utils;
 
+use aes_gcm_siv::aead::Aead;
+use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit};
 use base64::prelude::*;
 use k8s_openapi::chrono::{DateTime, Duration, Utc};
 use oidc_providers::OIDCProviders;
@@ -20,15 +22,16 @@ use salvo::routing::PathState;
 use salvo::{Listener, Service};
 use salvo_utils::{get_cookie, get_header, get_query_param, security_middleware};
 use serde::{Deserialize, Serialize};
-use serde_with::{DurationSecondsWithFrac, serde_as};
-use std::{env, fs, iter};
+use serde_with::{serde_as, DurationSecondsWithFrac};
 use std::sync::OnceLock;
+use std::{env, fs, iter};
 use tracing::{debug, error, info, trace, warn};
 use urlencoding::decode;
 
 static PROVIDERS: OnceLock<OIDCProviders> = OnceLock::new();
 static AUTHREQUEST_COOKIE_NAME: &str = "x_oidc_authrequest";
 static SESSION_COOKIE_NAME: &str = "x_oidc_session";
+static NONCE_COOKIE_NAME: &str = "x_oidc_nonce";
 
 static CONFIGURATION: OnceLock<Configuration> = OnceLock::new();
 
@@ -53,7 +56,7 @@ impl Default for Configuration {
         Self {
             session_duration: Duration::new(5 * 60 * 60, 0).unwrap(),
             access_token_refresh_lead: Duration::new(5 * 60, 0).unwrap(),
-            secret: "SwrFnZSsti^tH6fY%j!h6o!MsA$jnlsKr!I%Zl1b!XzfMrmDdiWe2AjL@rhT0sOVHn1VJcd^&2nL&#xTqGXtmKjfSU5m61SzK6*OBQ13LONO1KhVHTaz0y#Ao8%qpQcz".to_string()
+            secret: "SwrFnZSsti^tH6fY%j!h6o!MsA$jnlsK".to_string(),
         }
     }
 }
@@ -121,12 +124,10 @@ impl From<Configuration> for OptionalConfiguration {
 struct AuthRequestData {
     pub csrf_state: String,
     pub pkce_token: String,
-    pub nonce: Nonce,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AuthData {
-    pub nonce: Nonce,
     pub refresh_token: String,
     pub access_token_exp: DateTime<Utc>,
     pub subject: String,
@@ -157,7 +158,8 @@ struct ForwardAuthHeaders {
 enum AuthDataError {
     EmptySession,
     InvalidBase64,
-    InvalidDeserialize,
+    InvalidEncryption,
+    InvalidSerialization,
 }
 
 fn set_response_by_auth_data_error(res: &mut Response, err: &AuthDataError) {
@@ -170,7 +172,12 @@ fn set_response_by_auth_data_error(res: &mut Response, err: &AuthDataError) {
             res.status_code(StatusCode::UNAUTHORIZED)
                 .render(Text::Plain("Invalid Session"));
         }
-        AuthDataError::InvalidDeserialize => {
+        AuthDataError::InvalidEncryption => {
+            res.remove_cookie(SESSION_COOKIE_NAME);
+            res.status_code(StatusCode::UNAUTHORIZED)
+                .render(Text::Plain("Invalid Session"));
+        }
+        AuthDataError::InvalidSerialization => {
             res.remove_cookie(SESSION_COOKIE_NAME);
             res.status_code(StatusCode::UNAUTHORIZED)
                 .render(Text::Plain("Invalid Session"));
@@ -179,6 +186,11 @@ fn set_response_by_auth_data_error(res: &mut Response, err: &AuthDataError) {
 }
 
 fn get_auth_data_from_request(req: &mut Request) -> Result<AuthData, AuthDataError> {
+    let Some(nonce) = get_nonce_from_request(req) else {
+        debug!("Nonce was not found");
+        return Err(AuthDataError::EmptySession);
+    };
+
     let session = get_cookie(req, SESSION_COOKIE_NAME);
     if session.is_empty() {
         debug!("Session cookie was empty");
@@ -198,15 +210,104 @@ fn get_auth_data_from_request(req: &mut Request) -> Result<AuthData, AuthDataErr
         }
     };
 
-    let auth_data: AuthData = match bincode2::deserialize(&auth_data_value) {
+    let secret = &CONFIGURATION.get().unwrap().secret;
+
+    let nonce = aes_gcm_siv::Nonce::from_slice(nonce.secret()[..12].as_bytes());
+    let alg = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&secret[..].as_bytes()));
+
+    let Ok(unencrypted_data) = alg.decrypt(nonce, &auth_data_value[..]) else {
+        error!("Unable to encrypt data");
+        return Err(AuthDataError::InvalidEncryption);
+    };
+
+    let auth_data: AuthData = match bincode2::deserialize(&unencrypted_data) {
         Ok(v) => v,
         Err(err) => {
             error!("Unable to deserialize cookie {session} {}", err.to_string());
-            return Err(AuthDataError::InvalidDeserialize);
+            return Err(AuthDataError::InvalidSerialization);
         }
     };
 
     Ok(auth_data)
+}
+
+fn set_auth_data_on_response(
+    res: &mut Response,
+    nonce: &Nonce,
+    auth_data: &AuthData,
+) -> Result<(), AuthDataError> {
+    let data = match bincode2::serialize(auth_data) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Failed to serialize auth data: {}", err.to_string());
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .render(Text::Plain("Unable to process authentication"));
+            return Err(AuthDataError::InvalidSerialization);
+        }
+    };
+
+    let secret = &CONFIGURATION.get().unwrap().secret;
+
+    let nonce = aes_gcm_siv::Nonce::from_slice(nonce.secret()[..32].as_bytes());
+    let alg = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&secret[..].as_bytes()));
+
+    let Ok(encrypted_data) = alg.encrypt(nonce, &data[..]) else {
+        error!("Unable to encrypt data");
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR)
+            .render(Text::Plain("Unable to process authentication"));
+        return Err(AuthDataError::InvalidEncryption);
+    };
+
+    let cookie_value = BASE64_STANDARD.encode(encrypted_data);
+
+    res.add_cookie(
+        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
+            .secure(true)
+            .http_only(true)
+            .build(),
+    );
+
+    Ok(())
+}
+
+fn set_nonce_on_response(res: &mut Response, nonce: &Nonce) -> Result<(), AuthDataError> {
+    let data = match bincode2::serialize(nonce) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("Failed to serialize auth data: {}", err.to_string());
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .render(Text::Plain("Unable to process authentication"));
+            return Err(AuthDataError::InvalidSerialization);
+        }
+    };
+
+    let cookie_value = BASE64_STANDARD.encode(data);
+
+    res.add_cookie(
+        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
+            .secure(true)
+            .http_only(true)
+            .build(),
+    );
+
+    Ok(())
+}
+fn get_nonce_from_request(req: &mut Request) -> Option<Nonce> {
+    let cookie_value = get_cookie(req, NONCE_COOKIE_NAME);
+
+    if cookie_value.is_empty() {
+        return None;
+    }
+
+    let Ok(val) = BASE64_STANDARD.decode(cookie_value) else {
+        return None;
+    };
+
+    let Ok(nonce) = bincode2::deserialize::<Nonce>(&val) else {
+        return None;
+    };
+
+    Some(nonce)
 }
 
 #[handler]
@@ -226,10 +327,15 @@ async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mu
         .set_pkce_challenge(pkce_challenge)
         .url();
 
+    let Ok(_) = set_nonce_on_response(res, &nonce) else {
+        return res
+            .status_code(StatusCode::INTERNAL_SERVER_ERROR)
+            .render(Text::Plain("Unable to generate Cookie"));
+    };
+
     let auth_request_data = AuthRequestData {
         csrf_state: csrf_state.into_secret(),
         pkce_token: pkce_verifier.secret().clone(),
-        nonce,
     };
 
     let data = match bincode2::serialize(&auth_request_data) {
@@ -238,13 +344,23 @@ async fn forward_auth_handler(_req: &mut Request, res: &mut Response, depot: &mu
             error!("Failed to serialize auth data: {}", err.to_string());
             return res
                 .status_code(StatusCode::INTERNAL_SERVER_ERROR)
-                .render(Text::Plain("Unable to serialize auth data"));
+                .render(Text::Plain("Unable to process authentication"));
         }
     };
 
-    //TODO: Encrypt data
+    let secret = CONFIGURATION.get().unwrap().secret.clone();
 
-    let cookie_value = BASE64_STANDARD.encode(data);
+    let nonce = aes_gcm_siv::Nonce::from_slice(nonce.secret()[..12].as_bytes());
+    let alg = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&secret.into_bytes()));
+
+    let Ok(encrypted_data) = alg.encrypt(nonce, &data[..]) else {
+        error!("Unable to encrypt data");
+        return res
+            .status_code(StatusCode::INTERNAL_SERVER_ERROR)
+            .render(Text::Plain("Unable to process authentication"));
+    };
+
+    let cookie_value = BASE64_STANDARD.encode(encrypted_data);
 
     res.add_cookie(
         Cookie::build((AUTHREQUEST_COOKIE_NAME, cookie_value))
@@ -313,6 +429,12 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
 
     debug!("Renewing Access Token for session {session}");
 
+    let Some(nonce) = get_nonce_from_request(req) else {
+        return res
+            .status_code(StatusCode::UNAUTHORIZED)
+            .render(Text::Plain("Missing Nonce"));
+    };
+
     let auth_data = match get_auth_data_from_request(req) {
         Ok(v) => v,
         Err(err) => {
@@ -378,38 +500,25 @@ async fn renew_access_token(req: &mut Request, res: &mut Response, depot: &mut D
     let id_token_verifier = client.id_token_verifier();
     let id_token = token_response.id_token().expect("IdToken to exist");
 
-    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_data.nonce) else {
+    let Ok(claims) = id_token.claims(&id_token_verifier, &nonce) else {
         warn!("Unable to verify id_token '{}'", id_token.to_string());
         return res
             .status_code(StatusCode::UNAUTHORIZED)
             .render(Text::Plain("Invalid id_token"));
     };
 
-    let data = match bincode2::serialize(&AuthData {
-        refresh_token,
-        access_token_exp: claims.expiration()
-            - CONFIGURATION.get().unwrap().access_token_refresh_lead,
-        ..auth_data
-    }) {
-        Ok(v) => v,
-        Err(err) => {
-            error!("Failed to serialize auth data: {}", err.to_string());
-            return res
-                .status_code(StatusCode::INTERNAL_SERVER_ERROR)
-                .render(Text::Plain("Unable to serialize auth data"));
-        }
+    let Ok(_) = set_auth_data_on_response(
+        res,
+        &nonce,
+        &AuthData {
+            refresh_token,
+            access_token_exp: claims.expiration()
+                - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+            ..auth_data
+        },
+    ) else {
+        return;
     };
-
-    //TODO: Encrypt data
-
-    let cookie_value = BASE64_STANDARD.encode(data);
-
-    res.add_cookie(
-        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
 
     res.render(Redirect::temporary(format!(
         "{}://{}/{}",
@@ -470,11 +579,25 @@ fn check_params(req: &mut Request, _state: &mut PathState) -> bool {
         return false;
     }
 
+    let Some(nonce) = get_nonce_from_request(req) else {
+        return false;
+    };
+
     let Ok(decoded) = BASE64_STANDARD.decode(&authrequest_cookie) else {
         return false;
     };
 
-    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decoded) else {
+    let secret = CONFIGURATION.get().unwrap().secret.clone();
+
+    let nonce = aes_gcm_siv::Nonce::from_slice(nonce.secret()[..12].as_bytes());
+    let alg = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&secret.into_bytes()));
+
+    let Ok(decrypted_data) = alg.decrypt(nonce, &decoded[..]) else {
+        error!("Unable to decrypt data");
+        return false;
+    };
+
+    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decrypted_data) else {
         return false;
     };
 
@@ -517,7 +640,26 @@ async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
             .render(Text::Plain("Invalid Cookie"));
     };
 
-    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decoded) else {
+    let Some(nonce) = get_nonce_from_request(req) else {
+        error!("Unable to retrieve Nonce from request");
+        return res
+            .status_code(StatusCode::BAD_REQUEST)
+            .render(Text::Plain("Missing Nonce"));
+    };
+
+    let secret = CONFIGURATION.get().unwrap().secret.clone();
+
+    let encryption_nonce = aes_gcm_siv::Nonce::from_slice(nonce.secret()[..12].as_bytes());
+    let alg = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&secret.into_bytes()));
+
+    let Ok(decrypted_data) = alg.decrypt(encryption_nonce, &decoded[..]) else {
+        error!("Unable to decrypt authrequest cookie");
+        return res
+            .status_code(StatusCode::BAD_REQUEST)
+            .render(Text::Plain("Bad Cookie"));
+    };
+
+    let Ok(auth_request) = bincode2::deserialize::<AuthRequestData>(&decrypted_data) else {
         error!("Unable to Deserialize AuthRequest Cookie {authrequest_cookie}");
         return res
             .status_code(StatusCode::BAD_REQUEST)
@@ -535,7 +677,7 @@ async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
     let id_token = token_response.id_token().unwrap().to_owned();
     let id_token_verifier = client.id_token_verifier();
 
-    let Ok(claims) = id_token.claims(&id_token_verifier, &auth_request.nonce) else {
+    let Ok(claims) = id_token.claims(&id_token_verifier, &nonce) else {
         return res
             .status_code(StatusCode::UNAUTHORIZED)
             .render(Text::Plain("Unable to verify Id Token"));
@@ -559,36 +701,22 @@ async fn set_cookie(req: &mut Request, res: &mut Response, depot: &mut Depot) {
 
     res.remove_cookie(AUTHREQUEST_COOKIE_NAME);
 
-    let data = match bincode2::serialize(&AuthData {
-        nonce: auth_request.nonce,
-        refresh_token,
-        access_token_exp: claims.expiration()
-            - CONFIGURATION.get().unwrap().access_token_refresh_lead,
-        subject: claims.subject().to_string(),
-        email: claims.email().map(|v| v.to_string()),
-        name: claims.name().map(|v| v.get(None).unwrap().to_string()),
-        username: claims.preferred_username().map(|v| v.to_string()),
-        groups: None,
-    }) {
-        Ok(v) => v,
-        Err(err) => {
-            error!("Failed to serialize auth data: {}", err.to_string());
-            return res
-                .status_code(StatusCode::INTERNAL_SERVER_ERROR)
-                .render(Text::Plain("Unable to serialize auth data"));
-        }
+    let Ok(_) = set_auth_data_on_response(
+        res,
+        &nonce,
+        &AuthData {
+            refresh_token,
+            access_token_exp: claims.expiration()
+                - CONFIGURATION.get().unwrap().access_token_refresh_lead,
+            subject: claims.subject().to_string(),
+            email: claims.email().map(|v| v.to_string()),
+            name: claims.name().map(|v| v.get(None).unwrap().to_string()),
+            username: claims.preferred_username().map(|v| v.to_string()),
+            groups: None,
+        },
+    ) else {
+        return;
     };
-
-    //TODO: Encrypt data
-
-    let cookie_value = BASE64_STANDARD.encode(data);
-
-    res.add_cookie(
-        Cookie::build((SESSION_COOKIE_NAME, cookie_value))
-            .secure(headers.https)
-            .http_only(true)
-            .build(),
-    );
 
     // Todo: redirect to the page vistited before
     res.render(Redirect::temporary(format!(
